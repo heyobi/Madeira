@@ -270,7 +270,9 @@ jobs:
           set -eu
           build/stage-licenses.sh
           mkdir -p app/Madeira/x86_64-vcruntime app/Madeira/i386-windows
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.vcruntime }}" = "true" ]; then
+          # Bring-up branch: bundle the runtime on pushes too (manual runs need the workflow on main)
+          if { [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.vcruntime }}" = "true" ]; } \
+             || [ "${{ github.ref_name }}" = "build-ios-ipa" ]; then
             curl -fsSL -o /tmp/vc_redist.x64.exe https://aka.ms/vs/17/release/vc_redist.x64.exe
             7zz x -y /tmp/vc_redist.x64.exe -o/tmp/vcredist >/dev/null
             for cab in $(find /tmp/vcredist -iname '*.cab'); do 7zz x -y "$cab" -o/tmp/vcredist/cab >/dev/null || true; done
@@ -280,6 +282,8 @@ jobs:
               if [ -n "$src" ]; then cp "$src" "app/Madeira/x86_64-vcruntime/$f.dll"; else echo "::warning::$f.dll not found in VC_redist"; fi
             done
             ls app/Madeira/x86_64-vcruntime
+            n=$(ls app/Madeira/x86_64-vcruntime/*.dll 2>/dev/null | wc -l | tr -d ' ')
+            echo "VC++ runtime DLLs bundled: $n of 12"
           fi
 
       # ---------------------------------------------------------------- app
