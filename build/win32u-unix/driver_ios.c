@@ -2270,7 +2270,7 @@ C_ASSERT( sizeof(struct winios_gamepad) == 20 );
  * non-Madeira win32u returns for a code it does not know, so xinput1_3's
  * runtime probe falls back to the existing HID path.
  */
-ULONG_PTR ios_gamepad_query( UINT index, UINT op, void *buffer )
+static ULONG_PTR ios_gamepad_query_impl( UINT index, UINT op, void *buffer )
 {
     struct winios_gamepad pad;
 
@@ -2318,4 +2318,28 @@ ULONG_PTR ios_gamepad_query( UINT index, UINT op, void *buffer )
     default:
         return 0;
     }
+}
+
+/* Diagnostic: does the guest's XInput reach this slot reader, and what does it
+ * get back? Logs the first 64 queries, then every 4096th, so a title that
+ * polls every frame costs a handful of lines. `[xinput-q]` in madeira-log.txt. */
+ULONG_PTR ios_gamepad_query( UINT index, UINT op, void *buffer )
+{
+    static int calls;
+    ULONG_PTR ret = ios_gamepad_query_impl( index, op, buffer );
+    int n = __atomic_add_fetch( &calls, 1, __ATOMIC_RELAXED );
+
+    if (n <= 64 || !(n & 4095))
+    {
+        if (ret && op == 0)
+        {
+            const struct ios_xinput_state *st = buffer;
+            dprintf( 2, "[xinput-q] #%d idx=%u op=state ret=1 pkt=%u buttons=%04x lx=%d ly=%d\n",
+                     (int)n, index, (unsigned)st->packet_number, (unsigned)st->gamepad.buttons,
+                     st->gamepad.thumb_lx, st->gamepad.thumb_ly );
+        }
+        else
+            dprintf( 2, "[xinput-q] #%d idx=%u op=%u ret=%lu\n", (int)n, index, op, (unsigned long)ret );
+    }
+    return ret;
 }
