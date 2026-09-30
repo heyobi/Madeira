@@ -274,16 +274,7 @@ jobs:
           if { [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.vcruntime }}" = "true" ]; } \
              || [ "${{ github.ref_name }}" = "build-ios-ipa" ]; then
             curl -fsSL -o /tmp/vc_redist.x64.exe https://aka.ms/vs/17/release/vc_redist.x64.exe
-            7zz x -y /tmp/vc_redist.x64.exe -o/tmp/vcredist >/dev/null
-            for cab in $(find /tmp/vcredist -iname '*.cab'); do 7zz x -y "$cab" -o/tmp/vcredist/cab >/dev/null || true; done
-            for f in concrt140 msvcp140 msvcp140_1 msvcp140_2 msvcp140_atomic_wait msvcp140_codecvt_ids \
-                     vcamp140 vccorlib140 vcomp140 vcruntime140 vcruntime140_1 vcruntime140_threads; do
-              src=$(find /tmp/vcredist/cab -iname "$f.dll*" | head -1)
-              if [ -n "$src" ]; then cp "$src" "app/Madeira/x86_64-vcruntime/$f.dll"; else echo "::warning::$f.dll not found in VC_redist"; fi
-            done
-            ls app/Madeira/x86_64-vcruntime
-            n=$(ls app/Madeira/x86_64-vcruntime/*.dll 2>/dev/null | wc -l | tr -d ' ')
-            echo "VC++ runtime DLLs bundled: $n of 12"
+            python3 .github/scripts/fetch_vcruntime.py /tmp/vc_redist.x64.exe app/Madeira/x86_64-vcruntime
           fi
 
       # ---------------------------------------------------------------- app
