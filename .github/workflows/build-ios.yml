@@ -55,7 +55,7 @@ jobs:
 
       - name: Install host tools
         run: |
-          brew install cmake ninja ccache meson bison flex llvm sevenzip
+          brew install cmake ninja ccache meson bison flex llvm sevenzip gnutls pkgconf
           echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
           # FEX's configure scripts (Scripts/aarch64_fit_native.py) import packaging
@@ -114,6 +114,17 @@ jobs:
               s = s[:start] + '#ifdef _WIN32\n' + s[start:end] + '#endif\n' + s[end:]
               open(p, 'w').write(s)
               print('guarded the Win32-only [caspal128] reporter in Arm64.cpp')
+          # [rpm-cas] drain calls into the rpmalloc fork, which only the PE modules link.
+          p = 'FEX/FEXCore/Source/Interface/Core/Core.cpp'
+          s = open(p).read()
+          start = s.find('      {\n        rpm_cas_snapshot Snap;')
+          tail = 'Snap.fail_changed, Snap.fail_unchanged, Snap.fail_invalid);\n        }\n      }\n'
+          end = s.find(tail, start)
+          if start != -1 and end != -1 and '#ifdef FEX_IOS_HOST\n      {\n        rpm_cas_snapshot Snap;' not in s:
+              end += len(tail)
+              s = s[:start] + '#ifdef FEX_IOS_HOST\n' + s[start:end] + '#endif\n' + s[end:]
+              open(p, 'w').write(s)
+              print('guarded the rpmalloc-only [rpm-cas] drain in Core.cpp')
           PY
           build/fex-ios/build.sh || { cmake --build FEX/build-ios --target FEXCore FEXCore_Base JemallocLibs -- -k 2>&1 | grep -E "error:|Error " | head -80; exit 1; }
 
@@ -124,10 +135,13 @@ jobs:
           export PATH="$PWD/toolchains/${MINGW_NAME}/bin:$PATH"
           mkdir -p wine/build-macos
           cd wine/build-macos
-          ../configure --without-x --without-vulkan --without-freetype --without-gnutls \
+          # GnuTLS must be detected: bcrypt/secur32's unix tables are compiled only when config.h
+          # has SONAME_LIBGNUTLS / HAVE_GNUTLS_CIPHER_INIT (the iOS shim routes it to the static build)
+          ../configure --without-x --without-vulkan --without-freetype \
             --without-gstreamer --without-sdl --without-cups --without-krb5 --without-sane \
             --without-usb --without-pcap --without-v4l2 --without-opencl --disable-tests \
             --enable-winegstreamer
+          grep -E "SONAME_LIBGNUTLS|HAVE_GNUTLS_CIPHER_INIT" include/config.h || echo "::warning::GnuTLS not detected by Wine configure; bcrypt/secur32 will be missing"
           make -j"$(sysctl -n hw.ncpu)" include/all tools/all
 
       - name: FreeType for iOS (dwrite + win32u fonts)
