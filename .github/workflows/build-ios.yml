@@ -104,6 +104,16 @@ jobs:
               s = s[:start] + '#ifdef FEX_IOS_HOST\n' + s[start:end] + '#endif\n' + s[end:]
               open(p, 'w').write(s)
               print('guarded the FEX_IOS_HOST-only reporters in Core.cpp')
+          # [caspal128] reporter queries the region with Win32 VirtualQuery; Windows-only.
+          p = 'FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp'
+          s = open(p).read()
+          start = s.find('  MEMORY_BASIC_INFORMATION mbi {};')
+          end = s.find('mbi.Protect, type, mbi.State);', start)
+          if start != -1 and end != -1 and '#ifdef _WIN32\n  MEMORY_BASIC_INFORMATION' not in s:
+              end += len('mbi.Protect, type, mbi.State);\n')
+              s = s[:start] + '#ifdef _WIN32\n' + s[start:end] + '#endif\n' + s[end:]
+              open(p, 'w').write(s)
+              print('guarded the Win32-only [caspal128] reporter in Arm64.cpp')
           PY
           build/fex-ios/build.sh || { cmake --build FEX/build-ios --target FEXCore FEXCore_Base -- -k 2>&1 | grep -E "error:|Error " | head -80; exit 1; }
 
