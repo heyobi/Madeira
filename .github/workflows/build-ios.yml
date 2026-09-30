@@ -100,11 +100,17 @@ jobs:
             --without-gstreamer --without-sdl --without-cups --without-krb5 --without-sane \
             --without-usb --without-pcap --without-v4l2 --without-opencl --disable-tests \
             --enable-winegstreamer
-          make -j"$(sysctl -n hw.ncpu)" include tools
+          make -j"$(sysctl -n hw.ncpu)" include/all tools/all
 
       - name: Wine ntdll unix side
         continue-on-error: true
         run: build/ntdll-unix/build.sh
+
+      - name: FreeType for iOS (win32u fonts)
+        continue-on-error: true
+        run: |
+          [ -d research/freetype ] || git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype
+          build/freetype-ios/build.sh
 
       - name: Wine win32u unix side
         continue-on-error: true
@@ -250,6 +256,14 @@ jobs:
           name: Madeira-sideload-ipa
           path: Madeira-sideload.ipa
           retention-days: 14
+
+      - name: Print compiler errors
+        if: failure()
+        run: |
+          for f in build/*/obj/*.err build/*/obj/err-*.txt; do
+            [ -s "$f" ] || continue
+            echo "::group::$f"; head -n 40 "$f"; echo "::endgroup::"
+          done
 
       - name: Upload build logs on failure
         if: failure()
