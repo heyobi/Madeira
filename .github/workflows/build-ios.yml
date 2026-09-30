@@ -115,7 +115,7 @@ jobs:
               open(p, 'w').write(s)
               print('guarded the Win32-only [caspal128] reporter in Arm64.cpp')
           PY
-          build/fex-ios/build.sh || { cmake --build FEX/build-ios --target FEXCore FEXCore_Base -- -k 2>&1 | grep -E "error:|Error " | head -80; exit 1; }
+          build/fex-ios/build.sh || { cmake --build FEX/build-ios --target FEXCore FEXCore_Base JemallocLibs -- -k 2>&1 | grep -E "error:|Error " | head -80; exit 1; }
 
       - name: Configure Wine host tree (wine/build-macos) and generate headers
         continue-on-error: true
