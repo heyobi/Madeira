@@ -22,9 +22,29 @@ WANT = {n + ".dll" for n in (
 KEY = "OriginalFilename".encode("utf-16-le")
 
 
+def run(cmd):
+    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+
+
 def unpack(path, out):
-    return subprocess.run(["7zz", "x", "-y", path, "-o" + out],
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    """Unpack one layer. Returns True if anything was extracted. Exit codes are not trusted:
+    7-Zip reports warnings (trailing data, unsupported MSI tables) with a non-zero status."""
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(8)
+    except OSError:
+        return False
+    os.makedirs(out, exist_ok=True)
+    if magic[:4] == b"MSCF":                     # cabinet (Burn container or MSI media)
+        run(["cabextract", "-q", "-d", out, path])
+    elif magic == bytes.fromhex("d0cf11e0a1b11ae1"):  # MSI (OLE compound file)
+        run(["msiextract", "-C", out, path])
+    if not os.listdir(out):
+        run(["7zz", "x", "-y", path, "-o" + out])
+    if not os.listdir(out):
+        os.rmdir(out)
+        return False
+    return True
 
 
 def original_filename(data):
@@ -77,7 +97,10 @@ def main(exe, dest):
         print("missing: " + " ".join(missing))
         for root, _, files in os.walk(work):
             for f in files[:40]:
-                print("   ", os.path.relpath(os.path.join(root, f), work))
+                p = os.path.join(root, f)
+                with open(p, "rb") as fh:
+                    magic = fh.read(8).hex()
+                print(f"    {os.path.relpath(p, work)}  {os.path.getsize(p)}  {magic}")
         return 1
     return 0
 
