@@ -76,9 +76,73 @@ jobs:
           echo "${LLVM_MINGW_SHA256}  /tmp/llvm-mingw.tar.xz" | shasum -a 256 -c -
           tar -xJf /tmp/llvm-mingw.tar.xz -C toolchains
 
+      # ------------------------------------------------------- native libs
+      - name: GnuTLS / Nettle / GMP (headers for ntdll-unix)
+        continue-on-error: true
+        run: build/gnutls-ios/build.sh
+
+      - name: FFmpeg (LGPL, winegstreamer unix side)
+        continue-on-error: true
+        run: build/ffmpeg/build.sh
+
+      - name: FEXCore for iOS
+        continue-on-error: true
+        run: build/fex-ios/build.sh
+
+      - name: Configure Wine host tree (wine/build-macos) and generate headers
+        continue-on-error: true
+        run: |
+          set -eux
+          export PATH="$PWD/toolchains/${LLVM_MINGW}/bin:$PATH"
+          mkdir -p wine/build-macos
+          cd wine/build-macos
+          ../configure --without-x --without-vulkan --without-freetype --without-gnutls \
+            --without-gstreamer --without-sdl --without-cups --without-krb5 --without-sane \
+            --without-usb --without-pcap --without-v4l2 --without-opencl --disable-tests \
+            --enable-winegstreamer
+          make -j"$(sysctl -n hw.ncpu)" include tools
+
+      - name: Wine ntdll unix side
+        continue-on-error: true
+        run: build/ntdll-unix/build.sh
+
+      - name: Wine win32u unix side
+        continue-on-error: true
+        run: build/win32u-unix/build.sh
+
+      - name: Wine server (base archive from wine/server, then iOS replacements)
+        continue-on-error: true
+        run: |
+          set -eu
+          # build/wineserver/build.sh swaps its patched objects into a prebuilt base
+          # archive that is not tracked. Rebuild that base from the submodule: every
+          # server/*.c the script does not compile itself, with the script's own flags.
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          B=build/wineserver; W=wine; OBJ=$B/obj/base
+          mkdir -p "$OBJ"
+          REPLACED="async class event fd handle inproc_sync mach main mapping object process queue region request semaphore sock thread unicode user window winstation"
+          for src in $W/server/*.c; do
+            n=$(basename "$src" .c)
+            case " $REPLACED " in *" $n "*) continue ;; esac
+            echo "  base: $n"
+            xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 -O2 \
+              -I$W/include -I$W/include/wine -I$W/build-macos/include -I$B -I$W/server \
+              -Ibuild/ntdll-unix/shims -Ibuild/madsync -DHAVE_LINUX_NTSYNC_H=1 \
+              -include $B/config_ios.h -include stdarg.h -include $B/unicode_fix.h \
+              -include $B/wineserver_ios_kill.h \
+              -DBINDIR=\"/usr/local/bin\" -DDATADIR=\"/usr/local/share\" \
+              -D__WINESRC__ -DWINE_IOS=1 -Dmain=wineserver_main \
+              -Wno-implicit-function-declaration -Wno-int-conversion \
+              -c "$src" -o "$OBJ/$n.o" 2>"$B/obj/err-base-$n.txt" || { cat "$B/obj/err-base-$n.txt"; FAILED="${FAILED:-} $n"; }
+          done
+          [ -z "${FAILED:-}" ] || { echo "::error::base server objects failed:$FAILED"; exit 1; }
+          xcrun -sdk iphoneos ar rcs app/Madeira/libwineserver.a "$OBJ"/*.o
+          rm -rf "$OBJ"
+          build/wineserver/build.sh
+
       - name: Cache LLVM for iOS
         id: llvm-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             toolchains/llvm-project/llvm/include
@@ -116,61 +180,15 @@ jobs:
           ls toolchains/llvm-ios-build/lib/*.a | wc -l
           rm -rf toolchains/llvm-host-build
 
-      # ------------------------------------------------------- native libs
-      - name: GnuTLS / Nettle / GMP (headers for ntdll-unix)
-        run: build/gnutls-ios/build.sh
-
-      - name: FFmpeg (LGPL, winegstreamer unix side)
-        run: build/ffmpeg/build.sh
-
-      - name: FEXCore for iOS
-        run: build/fex-ios/build.sh
-
-      - name: Configure Wine host tree (wine/build-macos) and generate headers
-        run: |
-          set -eux
-          export PATH="$PWD/toolchains/${LLVM_MINGW}/bin:$PATH"
-          mkdir -p wine/build-macos
-          cd wine/build-macos
-          ../configure --without-x --without-vulkan --without-freetype --without-gnutls \
-            --without-gstreamer --without-sdl --without-cups --without-krb5 --without-sane \
-            --without-usb --without-pcap --without-v4l2 --without-opencl --disable-tests \
-            --enable-winegstreamer
-          make -j"$(sysctl -n hw.ncpu)" include tools
-
-      - name: Wine ntdll unix side
-        run: build/ntdll-unix/build.sh
-
-      - name: Wine win32u unix side
-        run: build/win32u-unix/build.sh
-
-      - name: Wine server (base archive from wine/server, then iOS replacements)
-        run: |
-          set -eu
-          # build/wineserver/build.sh swaps its patched objects into a prebuilt base
-          # archive that is not tracked. Rebuild that base from the submodule: every
-          # server/*.c the script does not compile itself, with the script's own flags.
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          B=build/wineserver; W=wine; OBJ=$B/obj/base
-          mkdir -p "$OBJ"
-          REPLACED="async class event fd handle inproc_sync mach main mapping object process queue region request semaphore sock thread unicode user window winstation"
-          for src in $W/server/*.c; do
-            n=$(basename "$src" .c)
-            case " $REPLACED " in *" $n "*) continue ;; esac
-            echo "  base: $n"
-            xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 -O2 \
-              -I$W/include -I$W/include/wine -I$W/build-macos/include -I$B -I$W/server \
-              -Ibuild/ntdll-unix/shims -Ibuild/madsync -DHAVE_LINUX_NTSYNC_H=1 \
-              -include $B/config_ios.h -include stdarg.h -include $B/unicode_fix.h \
-              -include $B/wineserver_ios_kill.h \
-              -DBINDIR=\"/usr/local/bin\" -DDATADIR=\"/usr/local/share\" \
-              -D__WINESRC__ -DWINE_IOS=1 -Dmain=wineserver_main \
-              -Wno-implicit-function-declaration -Wno-int-conversion \
-              -c "$src" -o "$OBJ/$n.o"
-          done
-          xcrun -sdk iphoneos ar rcs app/Madeira/libwineserver.a "$OBJ"/*.o
-          rm -rf "$OBJ"
-          build/wineserver/build.sh
+      - name: Save LLVM cache
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            toolchains/llvm-project/llvm/include
+            toolchains/llvm-ios-build/include
+            toolchains/llvm-ios-build/lib/*.a
+          key: llvm-ios-${{ env.LLVM_VERSION }}-v1
 
       - name: DXMT unix side + combined archive
         run: |
