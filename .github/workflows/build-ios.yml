@@ -92,7 +92,20 @@ jobs:
 
       - name: FEXCore for iOS
         continue-on-error: true
-        run: build/fex-ios/build.sh
+        run: |
+          # The FFS-bypass / cb-entry reporters in Core.cpp read counters that are only declared
+          # under FEX_IOS_HOST (the PE module builds); this native iOS FEXCore does not define it.
+          python3 - <<'PY'
+          p = 'FEX/FEXCore/Source/Interface/Core/Core.cpp'
+          s = open(p).read()
+          start = s.find('  /* iOS-Madeira ml316: report ExitToX64 FFS bypasses')
+          end = s.find('  /* iOS-Madeira: refuse to compile obviously-invalid guest RIPs.')
+          if start != -1 and end != -1 and '#ifdef FEX_IOS_HOST\n  /* iOS-Madeira ml316' not in s:
+              s = s[:start] + '#ifdef FEX_IOS_HOST\n' + s[start:end] + '#endif\n' + s[end:]
+              open(p, 'w').write(s)
+              print('guarded the FEX_IOS_HOST-only reporters in Core.cpp')
+          PY
+          build/fex-ios/build.sh || { cmake --build FEX/build-ios --target FEXCore FEXCore_Base -- -k 2>&1 | grep -E "error:|Error " | head -80; exit 1; }
 
       - name: Configure Wine host tree (wine/build-macos) and generate headers
         continue-on-error: true
