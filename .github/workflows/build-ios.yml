@@ -29,8 +29,8 @@ on:
         default: Debug
 
 env:
-  LLVM_MINGW: llvm-mingw-20260421-ucrt-macos-universal
-  LLVM_MINGW_SHA256: bd85a3975723815cef28dbbd2ca2cb0c926f6b348a12a0453f39f7af273cb3f7
+  MINGW_NAME: llvm-mingw-20260421-ucrt-macos-universal
+  MINGW_SHA256: bd85a3975723815cef28dbbd2ca2cb0c926f6b348a12a0453f39f7af273cb3f7
   # LLVM for DXMT's airconv (build/dxmt-ios/README.md)
   LLVM_VERSION: 15.0.7
 
@@ -58,6 +58,8 @@ jobs:
           brew install cmake ninja ccache meson bison flex llvm sevenzip
           echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+          # FEX's configure scripts (Scripts/aarch64_fit_native.py) import packaging
+          python3 -m pip install --user --break-system-packages packaging || pip3 install --break-system-packages packaging
 
       - name: Download Metal toolchain
         run: xcodebuild -downloadComponent MetalToolchain || echo "::warning::MetalToolchain download failed (may already be installed)"
@@ -67,16 +69,16 @@ jobs:
         id: mingw-cache
         uses: actions/cache@v4
         with:
-          path: toolchains/${{ env.LLVM_MINGW }}
-          key: ${{ env.LLVM_MINGW }}
+          path: toolchains/${{ env.MINGW_NAME }}
+          key: ${{ env.MINGW_NAME }}
 
       - name: Fetch llvm-mingw
         if: steps.mingw-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p toolchains
           curl -fsSL -o /tmp/llvm-mingw.tar.xz \
-            "https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/${LLVM_MINGW}.tar.xz"
-          echo "${LLVM_MINGW_SHA256}  /tmp/llvm-mingw.tar.xz" | shasum -a 256 -c -
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/${MINGW_NAME}.tar.xz"
+          echo "${MINGW_SHA256}  /tmp/llvm-mingw.tar.xz" | shasum -a 256 -c -
           tar -xJf /tmp/llvm-mingw.tar.xz -C toolchains
 
       # ------------------------------------------------------- native libs
@@ -96,7 +98,7 @@ jobs:
         continue-on-error: true
         run: |
           set -eux
-          export PATH="$PWD/toolchains/${LLVM_MINGW}/bin:$PATH"
+          export PATH="$PWD/toolchains/${MINGW_NAME}/bin:$PATH"
           mkdir -p wine/build-macos
           cd wine/build-macos
           ../configure --without-x --without-vulkan --without-freetype --without-gnutls \
