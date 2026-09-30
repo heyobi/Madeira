@@ -45,8 +45,11 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Show Xcode
+      - name: Select the newest Xcode
         run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$X/Contents/Developer"
           xcodebuild -version
           sysctl -n hw.ncpu
 
@@ -102,15 +105,21 @@ jobs:
             --enable-winegstreamer
           make -j"$(sysctl -n hw.ncpu)" include/all tools/all
 
-      - name: Wine ntdll unix side
-        continue-on-error: true
-        run: build/ntdll-unix/build.sh
-
-      - name: FreeType for iOS (win32u fonts)
+      - name: FreeType for iOS (dwrite + win32u fonts)
         continue-on-error: true
         run: |
           [ -d research/freetype ] || git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype
-          build/freetype-ios/build.sh
+          bash build/freetype-ios/build.sh
+
+      - name: Wine ntdll unix side
+        continue-on-error: true
+        run: |
+          # server_ios.c prints rusage_info_v6.ri_page_wait_time_mach, which older SDKs lack
+          if ! grep -q ri_page_wait_time_mach "$(xcrun --sdk iphoneos --show-sdk-path)/usr/include/sys/resource.h"; then
+            echo "::warning::SDK has no ri_page_wait_time_mach; reporting 0 for it"
+            sed -i '' 's/ru\.ri_page_wait_time_mach - pru\.ri_page_wait_time_mach/0/' build/ntdll-unix/server_ios.c
+          fi
+          build/ntdll-unix/build.sh
 
       - name: Wine win32u unix side
         continue-on-error: true
@@ -199,6 +208,14 @@ jobs:
       - name: DXMT unix side + combined archive
         run: |
           set -eu
+          # airconv embeds its AIR helper shaders as headers (research/dxmt/src/airconv/meson.build)
+          mkdir -p build/dxmt-ios/shader-headers
+          for sh in air_msad air_samplepos air_tessellation; do
+            (cd build/dxmt-ios/shader-headers \
+             && xcrun -sdk macosx metal -std=metal3.1 --target=air64-apple-macos14.0 \
+                  -o $sh.air -c ../../../research/dxmt/src/airconv/shaders/$sh.metal \
+             && xxd -n $sh -i $sh.air $sh.h)
+          done
           build/dxmt-ios/build.sh
           # libdxmt_combined.a = libdxmt_unix.a + the LLVM archives airconv needs
           libtool -static -o build/dxmt-ios/libdxmt_combined.a \
