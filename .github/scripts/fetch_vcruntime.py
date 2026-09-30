@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Extract the twelve x64 VC++ runtime DLLs (tools/fetch-vcruntime.md) from VC_redist.x64.exe.
 
-The redistributable is a bundle of MSIs whose cabinets name their members by MSI file key
-(e.g. F_CENTRAL_msvcp140_x64), not by DLL name. So everything is unpacked recursively with
-7-Zip and each x64 PE is identified by the OriginalFilename in its version resource.
+The redistributable is a WiX Burn bundle. 7-Zip only opens its UX container (theme, licence
+text, engine); the MSIs and their cabinets sit in an attached container appended to the exe as
+a plain cabinet. So every MSCF cabinet in a PE is carved out by the size in its header, and each
+layer is unpacked in turn. The MSI cabinets name their members by MSI file key
+(e.g. F_CENTRAL_msvcp140_x64), not by DLL name, so each x64 PE is identified by the
+OriginalFilename in its version resource.
 
 usage: fetch_vcruntime.py VC_redist.x64.exe DEST_DIR
 Exits non-zero unless all twelve DLLs were found. Files are copied byte for byte.
@@ -26,6 +29,26 @@ def run(cmd):
     return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
 
 
+def carve_cabinets(path, out):
+    """Write every well-formed MSCF cabinet embedded in the file at path to out/cabN.cab."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    n = 0
+    i = data.find(b"MSCF\0\0\0\0", 1)
+    while i >= 0:
+        size = struct.unpack_from("<I", data, i + 8)[0] if i + 36 <= len(data) else 0
+        # CFHEADER: cbCabinet at +8, coffFiles at +16, versionMinor/Major 3/1 at +24
+        ok = (36 <= size <= len(data) - i and data[i + 24:i + 26] == b"\x03\x01"
+              and struct.unpack_from("<I", data, i + 16)[0] < size)
+        if ok:
+            os.makedirs(out, exist_ok=True)
+            with open(os.path.join(out, f"cab{n}.cab"), "wb") as fh:
+                fh.write(data[i:i + size])
+            n += 1
+        i = data.find(b"MSCF\0\0\0\0", i + (size if ok else 4))
+    return n
+
+
 def unpack(path, out):
     """Unpack one layer. Returns True if anything was extracted. Exit codes are not trusted:
     7-Zip reports warnings (trailing data, unsupported MSI tables) with a non-zero status."""
@@ -39,6 +62,8 @@ def unpack(path, out):
         run(["cabextract", "-q", "-d", out, path])
     elif magic == bytes.fromhex("d0cf11e0a1b11ae1"):  # MSI (OLE compound file)
         run(["msiextract", "-C", out, path])
+    elif magic[:2] == b"MZ":                     # Burn bundle: attached container is a cabinet
+        carve_cabinets(path, out)
     if not os.listdir(out):
         run(["7zz", "x", "-y", path, "-o" + out])
     if not os.listdir(out):
@@ -64,7 +89,7 @@ def original_filename(data):
 def main(exe, dest):
     work = tempfile.mkdtemp(prefix="vcredist-")
     pending = [(exe, os.path.join(work, "0"))]
-    for _ in range(4):  # bundle -> embedded MSI/cab -> cab -> files
+    for _ in range(4):  # bundle -> attached cab -> MSI/payload cab -> files
         nxt = []
         for src, out in pending:
             if not unpack(src, out):
