@@ -653,6 +653,9 @@ final class LibraryModel: ObservableObject {
     static var sessionsThisRun = 0
     static let restartMessage = "Restart Madeira to start another game: swipe Madeira away in the app switcher, then open it again."
     @Published var restartNotice: String?
+    /// CS_DEBUGGED is set but no debugger is attached (JIT was enabled outside
+    /// Madeira): the text of the alert that offers Madeira's own Enable JIT.
+    @Published var jitNotice: String?
 
     /// `remember: false` runs a session that is not a library entry (a Madeira
     /// Dock start): it is neither added to the library nor stamped as played.
@@ -719,7 +722,15 @@ final class LibraryModel: ObservableObject {
             MetalBackedView.refreshDisplayMode(reason: "first-present")
         }
     }
-    func launchFailed() { if current != nil && !sawProcess { finish(); error = "The session could not start. Check the diagnostic log and JIT status." } }
+    /// `reason`: what stopped the launch, when the caller knows (the JIT pool's failure).
+    /// `offerJIT`: the launch failed because no debugger is attached, so the alert
+    /// offers Enable JIT instead of only reporting.
+    func launchFailed(_ reason: String? = nil, offerJIT: Bool = false) {
+        guard current != nil && !sawProcess else { return }
+        finish()
+        if offerJIT, let reason { jitNotice = reason }
+        else { error = reason ?? "The session could not start. Check the diagnostic log and JIT status." }
+    }
     /// Both flags change in one transaction without animation: the animated
     /// removal of a scrolling view with live content could leave the starting
     /// screen up (and unresponsive) while the game was already presenting.
@@ -954,7 +965,7 @@ struct LibraryTitleText: View {
 /// are disabled once it is.
 final class LibraryJITState: ObservableObject {
     static let shared = LibraryJITState()
-    @Published private(set) var enabled = jit_check_debugged()
+    @Published private(set) var enabled = StikJITHelper.ready
     private var timer: Timer?
     private init() {
         let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
@@ -962,7 +973,7 @@ final class LibraryJITState: ObservableObject {
         self.timer = timer
     }
     func refresh() {
-        let now = jit_check_debugged()
+        let now = StikJITHelper.ready
         guard now != enabled else { return }
         withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .default) { enabled = now }
     }
@@ -1419,7 +1430,7 @@ struct AmbientGlow: View {
         // A soft wash on the wall, and the brighter band just past the edge where the
         // strip's light lands first.
         return ZStack {
-            art().scaleEffect(1.11).blur(radius: size.width * 0.085)
+            art().scaleEffect(1.09).blur(radius: size.width * 0.07)
             art().scaleEffect(1.03).blur(radius: size.width * 0.03).opacity(0.75)
         }
         .frame(width: frame.width, height: frame.height)
@@ -1432,12 +1443,12 @@ struct AmbientGlow: View {
 
     var body: some View {
         // Kept tight, so neighbouring cards' light stays apart in the gaps between them.
-        let spread = size.width * 0.20
+        let spread = size.width * 0.17
         let frame = CGSize(width: size.width + spread * 2, height: size.height + spread * 2)
         let movie = AmbientMovie(seed: seed)
         let dark = scheme == .dark
         // A game that is not installed throws a fainter, less vivid light.
-        let strength = (dark ? 1.0 : 0.8) * (dimmed ? 0.3 : 1)
+        let strength = (dark ? 0.92 : 0.8) * (dimmed ? 0.3 : 1)
         let plain = layer(0, false, frame: frame), turned = layer(180, false, frame: frame), mirrored = layer(0, true, frame: frame)
         TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion)) { context in
             let t = context.date.timeIntervalSinceReferenceDate
@@ -1449,6 +1460,9 @@ struct AmbientGlow: View {
             }
             .compositingGroup()
             .hueRotation(.degrees(f.hue))
+            // In the dark the light adds to the page (plusLighter): a very bright artwork's
+            // light is brought down at the top (AmbientGlow.metal) so it does not glare.
+            .colorEffect(ShaderLibrary.ambientKnee(.float(dark ? 0.3 : 0)))
             .mask { AmbientMovie.mask(f.light) }
             .mask {
                 let turn = reduceMotion ? 0 : 1.2 * sin(t * 0.12 + Double(seed % 97))
@@ -1572,13 +1586,27 @@ enum AmbientArtwork {
     }
 }
 
+/// Whether the app's liquid metal is on: Settings › Appearance › Liquid metal, kept in
+/// madeira.cfg as env.MADEIRA_LIQUID_METAL (off, plain Liquid Glass, unless it is 1). It
+/// covers the Desktop button's fill (LiquidMetalFill) and the bars' glass (GlassSkin), and
+/// applies at once, fading between the two.
+@MainActor final class LiquidMetalSetting: ObservableObject {
+    static let shared = LiquidMetalSetting()
+    @Published var on = MadeiraConfig.flag("MADEIRA_LIQUID_METAL", fallback: false) {
+        didSet {
+            guard on != oldValue else { return }
+            MadeiraConfig.set("env.MADEIRA_LIQUID_METAL", on ? "1" : nil)
+            if on { GlassSkin.shared.start(fadeIn: true) } else { GlassSkin.shared.stop() }
+        }
+    }
+}
+
 /// A flowing liquid-chrome fill (LiquidMetal.metal, a SwiftUI color shader): white
 /// highlights, silver and navy, rainbow dispersion at the highlights' edges and a raised
 /// rim, in a capsule (a rounded box of radius half its height). Animated at 60 frames a
-/// second; held still with Reduce Motion. MADEIRA_LIQUID_METAL=0 turns it off, and the
-/// callers draw their previous fill.
+/// second; held still with Reduce Motion. Its callers draw their previous fill when liquid
+/// metal is off (LiquidMetalSetting).
 struct LiquidMetalFill: View {
-    static let enabled = MadeiraConfig.flag("MADEIRA_LIQUID_METAL")
     @Environment(\.displayScale) private var displayScale
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -1695,7 +1723,7 @@ struct LibraryStatus: View {
         .background((enabled ? Color.green : Color.red).opacity(0.1), in: RoundedRectangle(cornerRadius: 6))
         .accessibilityElement(children: .ignore).accessibilityLabel("\(label): \(enabled ? "enabled" : "unavailable")")
     }
-    private func update() { jit = jit_check_debugged(); memory = EntitlementStatus.check().increasedMemory }
+    private func update() { jit = StikJITHelper.ready; memory = EntitlementStatus.check().increasedMemory }
 }
 
 /// A section title with a count; with `collapsed` set, tapping the title
@@ -1764,6 +1792,7 @@ struct LibraryView: View {
     @ObservedObject private var model = LibraryModel.shared
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var liquidMetal = LiquidMetalSetting.shared
     var play: (LibraryEntry) -> Void
     var enableJIT: () -> Void
     @ObservedObject private var jitState = LibraryJITState.shared
@@ -1908,6 +1937,13 @@ struct LibraryView: View {
             if SteamSettingsSection.shown, settingsShow("Steam", "Dock", "sign in", "account", "setup") {
                 SteamSettingsSection(open: { settingsSheet = $0 })
             }
+            if settingsShow("appearance", "liquid metal", "metal", "glass") {
+                Section {
+                    Toggle("Liquid metal", isOn: $liquidMetal.on)
+                } header: { Text("Appearance") } footer: {
+                    Text("Flowing chrome on the bars and the Desktop button. Off, they use the system's Liquid Glass.")
+                }
+            }
             if settingsShow("interface", "developer") {
                 Section {
                     Toggle("Use developer interface", isOn: Binding(get: { developerUI }, set: { on in
@@ -1955,7 +1991,7 @@ struct LibraryView: View {
             VStack(alignment: .leading, spacing: 24) {
                 HStack {
                     Button { selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry } label: {
-                        if LiquidMetalFill.enabled {
+                        if liquidMetal.on {
                             // On the chrome's middle band (dark, or light in light mode), with a soft
                             // halo of the other tone for the moments a highlight passes under it.
                             let light = colorScheme == .light
@@ -1970,6 +2006,7 @@ struct LibraryView: View {
                                 .background(Color(uiColor: .secondarySystemGroupedBackground), in: Capsule())
                         }
                     }.buttonStyle(.plain)
+                        .animation(UIAccessibility.isReduceMotionEnabled ? nil : .easeInOut(duration: 0.4), value: liquidMetal.on)
                         .id(LibraryEntry.desktopID)
                         .overlay(RoundedRectangle(cornerRadius: 22).stroke(focused == LibraryEntry.desktopID && controller.connected ? Color.cyan : .clear, lineWidth: 3))
                 }
@@ -2050,6 +2087,7 @@ struct LibraryView: View {
         .onChange(of: model.current) { _, current in if current != nil { selected = nil } }
         .onChange(of: model.error) { _, error in if error != nil { selected = nil } }
         .onChange(of: model.restartNotice) { _, notice in if notice != nil { selected = nil } }
+        .onChange(of: model.jitNotice) { _, notice in if notice != nil { selected = nil } }
         .alert("Library", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button("OK", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }
