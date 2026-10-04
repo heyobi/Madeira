@@ -82,6 +82,11 @@ jobs:
           tar -xJf /tmp/llvm-mingw.tar.xz -C toolchains
 
       # ------------------------------------------------------- native libs
+      - name: Build madeira_rppairing (Rust)
+        run: |
+          rustup target add aarch64-apple-ios
+          build/rppairing-ios/build.sh
+          
       - name: GnuTLS / Nettle / GMP (headers for ntdll-unix)
         run: build/gnutls-ios/build.sh
 
