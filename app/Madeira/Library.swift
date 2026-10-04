@@ -40,15 +40,17 @@ enum DeviceLoadDiagnostics {
         guard now - lastReport >= 10 else { return }
         lastReport = now
         let process = ProcessInfo.processInfo
-        let thermal: String
-        switch process.thermalState {
-        case .nominal: thermal = "nominal"
-        case .fair: thermal = "fair"
-        case .serious: thermal = "serious"
-        case .critical: thermal = "critical"
-        @unknown default: thermal = "unknown"
-        }
+        let thermal = thermalName(process.thermalState)
         fputs("[device-load] thermal=\(thermal) low-power=\(process.isLowPowerModeEnabled ? 1 : 0) capture=\(UIScreen.main.isCaptured ? 1 : 0)\n", stderr)
+    }
+    static func thermalName(_ state: ProcessInfo.ThermalState) -> String {
+        switch state {
+        case .nominal: return "nominal"
+        case .fair: return "fair"
+        case .serious: return "serious"
+        case .critical: return "critical"
+        @unknown default: return "unknown"
+        }
     }
 }
 
@@ -195,6 +197,21 @@ struct LibraryEntry: Codable, Identifiable {
     /// nil = 1) in this game's sessions.
     var controlOpacity: Double?
     var controlSize: Double?
+    /// How a physical controller reaches this game: nil, the game's own support
+    /// (XInput, as before); "dinput", XInput and a DirectInput joystick of the same
+    /// pad (for games older than XInput; a game reading both APIs sees two
+    /// controllers); "keys", keyboard and mouse (PadKeyboardMouse: the pad
+    /// presses keys and moves the mouse, the game sees no controller). For games
+    /// without controller support. Optional, so older files decode.
+    var controllerMode: String?
+    /// Keyboard-and-mouse mode: what each controller input does in this game
+    /// (PadBindings.buttonNames plus "LS"/"RS" → key, mouse button, key stick or
+    /// .none), on top of the layout's bindings and the built-in template. Only
+    /// inputs the player changed are stored. Optional, so older files decode.
+    var controllerBinds: [String: ControlAction]?
+    /// Keyboard-and-mouse mode: vertical speed of the right-stick mouse relative
+    /// to horizontal (PadBindings.mouseVertical); nil = 1.
+    var padMouseVertical: Double?
     /// Processors reported to Windows code in this game's sessions
     /// (MADEIRA_CPU_COUNT, ntdll); nil = automatic.
     var cpuCount: Int?
@@ -228,6 +245,17 @@ struct LibraryEntry: Codable, Identifiable {
     /// library files decode; the fork's files carry the same keys.
     var fastSync: Bool?
     var semaphoreFastPath: Bool?
+    /// This game's own lines in madeira.cfg's syntax (Game details › This game's
+    /// config). At launch a key set here wins over madeira.cfg, env.NAME lines are
+    /// exported after madeira.cfg's and dxmt options are added to its own
+    /// (MadeiraConfig.applyGame). nil: none.
+    var config: String?
+    /// AVX and AVX2 for this game (FEX's 128-bit AVX emulation, MADEIRA_FEX_AVX);
+    /// nil = off, FEX's iOS default.
+    var avx: Bool?
+    /// Experimental MetalFX frame interpolation between the game's frames
+    /// (DXMT's present path, MADEIRA_FRAMEGEN); nil = off.
+    var frameGeneration: Bool?
 
     var displayMode: DisplayMode { display.flatMap(DisplayMode.init(rawValue:)) ?? .fit }
 
@@ -282,6 +310,10 @@ struct LibraryEntry: Codable, Identifiable {
         // WineProcessBridge takes at most 64 arguments in 4 KB.
         guard launchArguments.utf8.count < 4096 else { throw LibraryError.message("The complete launch command is too long.") }
         guard !quoted, tokens <= 64 else { throw LibraryError.message("Use balanced double quotes and at most 64 launch arguments in total.") }
+        // build/madeira_cfg.h reads at most 64 KB of a file.
+        guard (config?.utf8.count ?? 0) < 60_000, config?.contains("\0") != true else {
+            throw LibraryError.message("This game's config is too long.")
+        }
     }
 
     /// Runs on the launch worker, before the JIT pool is taken.
@@ -292,7 +324,15 @@ struct LibraryEntry: Codable, Identifiable {
         // Exported only when chosen: unset keeps the engine's own default (and any
         // madeira.cfg setting), as before these choices existed.
         if let cpuCount, (1..<64).contains(cpuCount) { setenv("MADEIRA_CPU_COUNT", String(cpuCount), 1) }
+        // "dinput": the host pad also as a DirectInput joystick (wine/dlls/dinput/joystick_ios.c,
+        // off by default because a game reading both APIs would see two controllers).
+        // Exported only for that choice; madeira.cfg's own MADEIRA_DINPUT_PAD still applies otherwise.
+        if GamepadInput.keyboardMouseAvailable, controllerMode == "dinput" { setenv("MADEIRA_DINPUT_PAD", "1", 1) }
+        else if MadeiraConfig.get("env.MADEIRA_DINPUT_PAD") == nil { unsetenv("MADEIRA_DINPUT_PAD") }
         if let anisotropyLimit, [1, 2, 4, 8].contains(anisotropyLimit) { setenv("DXMT_D9_ANISO_LIMIT", String(anisotropyLimit), 1) }
+        // Set or unset, so a previous session's choice never stays.
+        if avx == true { setenv("MADEIRA_FEX_AVX", "1", 1) } else { unsetenv("MADEIRA_FEX_AVX") }
+        if frameGeneration == true { setenv("MADEIRA_FRAMEGEN", "1", 1) } else { unsetenv("MADEIRA_FRAMEGEN") }
         // Fastsync's per-game switches, only when Settings chose Fastsync; with Madsync
         // (the default) or Wine's standard sync nothing is exported here.
         if SyncEngine.current == .fastsync {
@@ -301,6 +341,15 @@ struct LibraryEntry: Codable, Identifiable {
             setenv("MADEIRA_FASTSYNC_SEM", semaphoreFastPath == true ? "1" : "0", 1)
         }
         madeira_set_vsync_locked(effectiveFPSMode)
+        // This game's own lines; a launch without any unsets the previous game's.
+        do {
+            let pairs = try MadeiraConfig.applyGame(config)
+            if !pairs.isEmpty {
+                LogStore.shared.log("[game-cfg] " + pairs.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
+            }
+        } catch {
+            LogStore.shared.log("[game-cfg] this game's config could not be written: \(error.localizedDescription)")
+        }
         fputs("[frontend] launch profile applied\n", stderr)
         LogStore.shared.log("[display-shape] resolution=\(resolution) mode=\(displayMode.rawValue)")
     }
@@ -348,6 +397,19 @@ final class LibraryModel: ObservableObject {
     @Published var performance = false
     @Published var liveLogs = false
     @Published var fpsMode = 1
+    /// The session's controller mode (LibraryEntry.controllerMode): "keys" or nil.
+    @Published var controllerMode: String? {
+        didSet { if oldValue != controllerMode { applyControllerMode() } }
+    }
+    /// The session's binds table (LibraryEntry.controllerBinds); a change rebuilds
+    /// the driver's bindings at once, so the binds page is live.
+    @Published var controllerBinds: [String: ControlAction] = [:] {
+        didSet { if oldValue != controllerBinds { applyControllerMode() } }
+    }
+    /// The session's right-stick mouse vertical speed (LibraryEntry.padMouseVertical).
+    @Published var padMouseVertical: Double = 1 {
+        didSet { if oldValue != padMouseVertical { applyControllerMode() } }
+    }
     /// The session's touch-control opacity (the entry's Control opacity).
     @Published var opacity = 0.7
     /// The session's Aspect & scaling; MetalBackedView lays the game out with it.
@@ -656,6 +718,9 @@ final class LibraryModel: ObservableObject {
     /// CS_DEBUGGED is set but no debugger is attached (JIT was enabled outside
     /// Madeira): the text of the alert that offers Madeira's own Enable JIT.
     @Published var jitNotice: String?
+    /// Play is enabling JIT before starting this entry (ContentView.jitReadyForLaunch):
+    /// its Play button reads Starting JIT, with a spinner, until JIT is on or fails.
+    @Published var startingJIT: UUID?
     /// A Steam game's saves may not be the latest (SteamOwnedLibrary.cloudHold):
     /// the alert Play shows before starting it.
     struct CloudNotice: Equatable {
@@ -703,6 +768,10 @@ final class LibraryModel: ObservableObject {
         }
         controls.visible = entry.touchControls
         controls.sizeScale = min(max(entry.controlSize ?? 1, 0.5), 2)
+        controllerBinds = GamepadInput.keyboardMouseAvailable ? (entry.controllerBinds ?? [:]) : [:]
+        padMouseVertical = GamepadInput.keyboardMouseAvailable ? (entry.padMouseVertical ?? 1) : 1
+        controllerMode = GamepadInput.keyboardMouseAvailable ? entry.controllerMode : nil
+        applyControllerMode()
         MetalHostView.shared.isHidden = false
         ProMotionIntent.apply(mode: entry.effectiveFPSMode)
         if remember { var played = entry; played.lastPlayed = Date(); save(played) }
@@ -765,6 +834,26 @@ final class LibraryModel: ObservableObject {
         fputs("[startup-log] visible=\(launchLogs ? 1 : 0)\n", stderr)
     }
 
+    /// Hand the session's mode to the pad sampler. In keyboard-and-mouse mode the
+    /// bindings follow the touch layout on screen, so they are rebuilt when the
+    /// controls change (TouchControlsModel.controls, observed below).
+    func applyControllerMode() {
+        guard GamepadInput.keyboardMouseAvailable else { return }
+        if current != nil, controllerMode == "keys" {
+            GamepadInput.shared.setKeyboardMouse(PadBindings.build(controls: TouchControlsModel.shared.controls, binds: controllerBinds, mouseVertical: padMouseVertical))
+            if controlsSink == nil {
+                controlsSink = TouchControlsModel.shared.$controls.sink { [weak self] controls in
+                    guard let self, self.controllerMode == "keys", self.current != nil else { return }
+                    GamepadInput.shared.setKeyboardMouse(PadBindings.build(controls: controls, binds: self.controllerBinds, mouseVertical: self.padMouseVertical))
+                }
+            }
+        } else {
+            controlsSink = nil
+            GamepadInput.shared.setKeyboardMouse(nil)
+        }
+    }
+    private var controlsSink: AnyCancellable?
+
     func setFPS(_ mode: Int) {
         fpsMode = mode
         let applied: Int32 = mode == 3 && !ProMotionIntent.has30Cap ? 1 : Int32(mode)
@@ -799,6 +888,9 @@ final class LibraryModel: ObservableObject {
             entry.fpsMode = fpsMode; entry.performance = performance
             entry.overlayFields = overlayFields
             entry.controlOpacity = opacity; entry.controlSize = controls.sizeScale
+            if GamepadInput.keyboardMouseAvailable { entry.controllerMode = controllerMode }
+            if GamepadInput.keyboardMouseAvailable { entry.controllerBinds = controllerBinds.isEmpty ? nil : controllerBinds }
+            if GamepadInput.keyboardMouseAvailable { entry.padMouseVertical = padMouseVertical == 1 ? nil : padMouseVertical }
             // The in-game Aspect & scaling choice sticks to the game. MADEIRA_SESSION_TOOLS=0
             // hides that picker and leaves the stored choice alone.
             if MadeiraConfig.flag("MADEIRA_SESSION_TOOLS") { entry.display = displayMode.rawValue }
@@ -809,6 +901,9 @@ final class LibraryModel: ObservableObject {
         if sawProcess, let report = exitReport() { error = report }
         timer?.invalidate(); timer = nil
         saveCurrentProfile()
+        controllerMode = nil
+        controllerBinds = [:]
+        padMouseVertical = 1
         let controls = TouchControlsModel.shared
         controls.editing = false; controls.selected = nil
         controls.controls = savedControls; controls.visible = savedVisible; controls.sizeScale = savedSize
@@ -1816,6 +1911,11 @@ struct LibraryView: View {
     var startDock: (DockGame, Bool) -> Void = { _, _ in }
     /// First-run setup (Onboarding.swift).
     @ObservedObject private var onboarding = OnboardingModel.shared
+    @ObservedObject private var jit = JITCoordinator.shared
+    /// The library's error is a JIT connection problem with a fix to offer.
+    private var jitProblem: JITCoordinator.ConnectionProblem? {
+        jit.connectionProblem.flatMap { model.error == $0.message ? $0 : nil }
+    }
     @State private var browser = false
     @State private var selected: LibraryEntry?
     @State private var search = ""
@@ -1876,6 +1976,14 @@ struct LibraryView: View {
             LibraryLargeTitle()
             if tab == 0 { libraryToolbar } else { settingsToolbar }
         }
+        // On the tab view, not inside one tab's page: an alert attached to the Library
+        // page cannot present while Settings is showing, so an error raised there (its
+        // Enable JIT, for one) waited until the Library tab came back.
+        .alert(jitProblem == nil ? "Library" : "Couldn't Enable JIT",
+               isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
+            if let jitProblem { jitConnectionActions(jitProblem, retry: enableJIT) { model.error = nil } }
+            Button("OK", role: .cancel) { model.error = nil }
+        } message: { Text(model.error ?? "") }
         .fullScreenCover(isPresented: $onboarding.presented) { OnboardingView() }
         .onAppear {
             // An ended desktop session's surface never stays over the library.
@@ -1936,6 +2044,9 @@ struct LibraryView: View {
             if settingsShow("ready to play", "JIT", "Memory+", "StikDebug", "status") {
                 Section { LibraryStatus().listRowBackground(Color.clear) }
             }
+            if settingsShow("JIT", "StikDebug", "built-in", "pairing", "LocalDevVPN") {
+                JITSettingsSection()
+            }
             if settingsShow("diagnostics", "extended logging", "logging", "log") {
                 Section {
                     Toggle("Extended logging", isOn: $input.diagnostics)
@@ -1974,14 +2085,15 @@ struct LibraryView: View {
                 SettingsSearchResults(query: settingsSearch.trimmingCharacters(in: .whitespaces), refresh: settingsRefresh)
             }
             // Credits, last on the Settings page.
-            if settingsShow("credits", "thanks", "Will Faust", "Nick", "125hz", "Jfishin", "Jesse", "JesseLovelace") {
+            if settingsShow("credits", "thanks", "Will Faust", "Nick", "125hz", "Jfishin", "Jesse", "JesseLovelace", "Dan Perks", "danperks") {
                 Section {
                     MadeiraCredit(name: "Will Faust", handle: "willfaust", role: "Created Madeira")
                     MadeiraCredit(name: "Nick", handle: "125hz", role: "32-bit game support, the game library and Madeira Dock")
                     MadeiraCredit(name: "Jfishin", handle: "Jfishin", role: "The original native Steam sign-in, library and downloads")
                     MadeiraCredit(name: "Jesse", handle: "JesseLovelace", role: "Steam Cloud saves, faster game launches, and fixes that let more games run")
+                    MadeiraCredit(name: "Dan Perks", handle: "danperks", role: "In-app JIT without StikDebug, and pairing without a computer")
                 } header: { Text("Credits") } footer: {
-                    Text("Madeira is built on Wine, FEX-Emu, DXMT by Feifan He (3Shain) with the Direct3D 9 frontend by David Acevedo (dacevedo12), rpmalloc by Mattias Jansson, and StikDebug for enabling JIT. Thank you to everyone who contributes to these projects.")
+                    Text("Madeira is built on Wine, FEX-Emu, DXMT by Feifan He (3Shain) with the Direct3D 9 frontend by David Acevedo (dacevedo12), rpmalloc by Mattias Jansson, StikDebug, StikJIT and idevice. Thank you to everyone who contributes to these projects.")
                 }
             }
         }
@@ -2098,7 +2210,11 @@ struct LibraryView: View {
             // library for the moment a start spends preparing.
             LibraryDetail(entry: entry, play: { profile in
                 play(profile)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 15) { if selected?.id == entry.id { selected = nil } }
+                // Not while Play is still enabling JIT: the session's start, an error, or
+                // JIT setup closes the page then.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
+                    if selected?.id == entry.id, model.startingJIT != entry.id { selected = nil }
+                }
             })
         }
         .onChange(of: model.current) { _, current in if current != nil { selected = nil } }
@@ -2106,14 +2222,12 @@ struct LibraryView: View {
         .onChange(of: model.restartNotice) { _, notice in if notice != nil { selected = nil } }
         .onChange(of: model.jitNotice) { _, notice in if notice != nil { selected = nil } }
         .onChange(of: model.cloudNotice) { _, notice in if notice != nil { selected = nil } }
+        .onChange(of: jit.showSetup) { _, show in if show { selected = nil } }
         .onChange(of: model.showDetail) { _, id in
             guard let id else { return }
             model.showDetail = nil
             selected = model.entries.first { $0.id == id }
         }
-        .alert("Library", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
-            Button("OK", role: .cancel) { model.error = nil }
-        } message: { Text(model.error ?? "") }
         .onChange(of: scenePhase) { _, phase in if phase == .active { model.refreshFlag() } }
         .onAppear {
             if focused == nil { focused = LibraryEntry.desktopID }
@@ -2241,6 +2355,11 @@ struct LibraryDetail: View {
         guard (640...4096).contains(width), width != 1280, width != 960 else { return nil }
         return "\(width)x720"
     }
+    /// "None", or how many keys this game's own config sets.
+    static func configSummary(_ config: String?) -> String {
+        let count = MadeiraConfig.parse(config ?? "").count
+        return count == 0 ? "None" : count == 1 ? "1 setting" : "\(count) settings"
+    }
     private func start() {
         guard !leaving else { return }
         // A Steam game starts through Madeira Dock (ContentView.launchLibraryEntry)
@@ -2286,8 +2405,18 @@ struct LibraryDetail: View {
                             } else if let played = entry.lastPlayed {
                                 Text("Last played \(played.formatted(.relative(presentation: .named)))").font(.subheadline).foregroundStyle(.secondary)
                             }
-                            Button(action: start) { HStack(spacing: 10) { Image(systemName: "play.fill"); Text("Play").fontWeight(.semibold) }.frame(minWidth: 100, minHeight: 30) }
-                                .buttonStyle(LibraryPlayStyle(pending: leaving)).disabled(leaving)
+                            Button(action: start) {
+                                HStack(spacing: 10) {
+                                    // Enabling JIT can take seconds with nothing else on screen.
+                                    if model.startingJIT == entry.id {
+                                        ProgressView().tint(.white)
+                                        Text("Starting JIT").fontWeight(.semibold)
+                                    } else {
+                                        Image(systemName: "play.fill"); Text("Play").fontWeight(.semibold)
+                                    }
+                                }.frame(minWidth: 100, minHeight: 30)
+                            }
+                            .buttonStyle(LibraryPlayStyle(pending: leaving)).disabled(leaving)
                         }
                     }.padding(.vertical, 24)
                         .listRowBackground(
@@ -2324,9 +2453,32 @@ struct LibraryDetail: View {
                         ForEach(DisplayMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
                     }
                     FPSChoice(mode: $entry.fpsMode)
+                    // The Desktop too: its programs present through the same path, and its
+                    // launch exports the switch like a game's (applyEnvironment).
+                    Toggle("Frame generation (experimental)", isOn: Binding(get: { entry.frameGeneration ?? false }, set: { entry.frameGeneration = $0 ? true : nil }))
+                    if entry.frameGeneration == true {
+                        Text("Shows a MetalFX-generated frame between every two rendered frames: twice the frames on screen, at the cost of GPU time, some latency and artifacts at edges and on the HUD. FPS limits do not apply while it is on.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                // A Steam game starts with Steam's own launch option through Madeira Dock.
+                if entry.desktop != true && entry.steamAppID == nil {
+                    Section {
+                        TextField("Launch arguments", text: $entry.arguments, axis: .vertical)
+                            .font(.body.monospaced()).lineLimit(1...4)
+                            .autocorrectionDisabled().textInputAutocapitalization(.never)
+                        LaunchFlagChips(arguments: $entry.arguments)
+                        // What the next start runs.
+                        Text(([(entry.relativePath as NSString).lastPathComponent] + (entry.arguments.isEmpty ? [] : [entry.arguments])).joined(separator: " "))
+                            .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                    } header: { Text("Launch arguments") } footer: {
+                        Text("Passed to the program on every start; the line above is the command that runs. The flags add or remove themselves; the renderer flags exclude each other, as do -windowed and -fullscreen.")
+                    }
                 }
                 Section {
                     Toggle("Reduced-precision x87", isOn: $entry.reducedX87)
+                    // Exported for this game only when chosen (applyEnvironment).
+                    Toggle("AVX and AVX2", isOn: Binding(get: { entry.avx ?? false }, set: { entry.avx = $0 ? true : nil }))
                     // Exported for this game only when chosen (applyEnvironment).
                     Picker("CPU cores reported", selection: Binding(get: { entry.cpuCount ?? 0 }, set: { entry.cpuCount = $0 == 0 ? nil : $0 })) {
                         Text("Automatic").tag(0)
@@ -2348,17 +2500,26 @@ struct LibraryDetail: View {
                         Text("Fast synchronization and fast semaphore waits are Fastsync options. Choose Fastsync in Settings › Memory & sync to use them.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
-                    // A Steam game starts with Steam's own launch option through Madeira Dock.
-                    if entry.desktop != true && entry.steamAppID == nil {
-                        TextField("Launch arguments", text: $entry.arguments, axis: .vertical).autocorrectionDisabled().textInputAutocapitalization(.never)
-                    }
                 } header: { Text("Compatibility & performance") } footer: {
-                    Text("Reduced-precision x87 can make older games faster at some cost in accuracy; it is off by default. With Fastsync, fast synchronization (on by default) handles events without a server round trip, and fast semaphore waits (off by default) does the same for semaphores. Settings apply to the next launch; a precision change may still require restarting Madeira.")
+                    Text("Reduced-precision x87 can make older games faster at some cost in accuracy; it is off by default. Turn on AVX and AVX2 (off by default, 64-bit games) when a game built for AVX processors quits at start with an illegal instruction (c000001d); FEX then emulates AVX, which is slower. With Fastsync, fast synchronization (on by default) handles events without a server round trip, and fast semaphore waits (off by default) does the same for semaphores. Settings apply to the next launch; a precision change may still require restarting Madeira.")
                 }
                 Section("On screen") {
                     Toggle("Performance overlay", isOn: $entry.performance)
                     Toggle("Live logs", isOn: $entry.liveLogs)
                     Toggle("Touch controls", isOn: $entry.touchControls)
+                    if GamepadInput.keyboardMouseAvailable {
+                        ControllerModeChoice(mode: $entry.controllerMode)
+                        if entry.controllerMode == "keys" {
+                            NavigationLink("Controller binds") {
+                                Form { ControllerBindsPage(binds: $entry.controllerBinds, mouseVertical: $entry.padMouseVertical) }
+                                    .navigationTitle("Controller binds")
+                                    .toolbar {
+                                        Button("Reset") { entry.controllerBinds = nil; entry.padMouseVertical = nil }
+                                            .disabled(entry.controllerBinds == nil && entry.padMouseVertical == nil)
+                                    }
+                            }
+                        }
+                    }
                     LabeledContent("Control opacity") {
                         Slider(value: Binding(get: { entry.controlOpacity ?? 0.7 }, set: { entry.controlOpacity = $0 }), in: 0.15...1)
                     }
@@ -2366,6 +2527,19 @@ struct LibraryDetail: View {
                         Slider(value: Binding(get: { entry.controlSize ?? 1 }, set: { entry.controlSize = $0 }), in: 0.5...2)
                     }
                     Text("Arrange buttons and choose XInput, mouse, or keyboard actions from the in-game menu.").font(.caption).foregroundStyle(.secondary)
+                    if GamepadInput.keyboardMouseAvailable {
+                        Text("XInput and DirectInput: for games older than XInput, which read the pad through DirectInput. The same pad is offered through both APIs, so a game that reads both may list two controllers. Applies to the next launch.").font(.caption).foregroundStyle(.secondary)
+                        Text("Keyboard and mouse: for games without controller support. The controller presses keys and moves the mouse (left stick WASD, right stick mouse, triggers click, D-pad arrows, Start Esc, Select Tab) and the game sees no controller. Change what each button does under Controller binds, here or in the in-game menu.").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Section {
+                    NavigationLink {
+                        LibraryGameConfigEditor(text: Binding(get: { entry.config ?? "" }, set: { entry.config = $0.isEmpty ? nil : $0 }))
+                    } label: {
+                        LabeledContent("This game's config", value: Self.configSummary(entry.config))
+                    }
+                } header: { Text("Advanced") } footer: {
+                    Text("Lines in madeira.cfg's format for this game only. A key set here wins over madeira.cfg wherever the runtime reads it, env.NAME lines are exported after madeira.cfg's, and dxmt options are added to madeira.cfg's. Applies from the next start.")
                 }
                 if entry.steamAppID != nil {
                     Section {
@@ -2419,6 +2593,25 @@ struct LibraryDetail: View {
     }
 }
 
+/// Game details › This game's config: the game's own lines in madeira.cfg's
+/// syntax, saved with the entry and applied at its next start
+/// (LibraryEntry.config, MadeiraConfig.applyGame).
+struct LibraryGameConfigEditor: View {
+    @Binding var text: String
+    var body: some View {
+        Form {
+            Section {
+                TextEditor(text: $text)
+                    .font(.caption.monospaced()).frame(minHeight: 260)
+                    .autocorrectionDisabled().textInputAutocapitalization(.never)
+            } footer: {
+                Text("One key = value per line, as in madeira.cfg; lines starting with # are comments. Examples: fence-chain = 6, dxmt = d3d11.mipClampBC=1, env.FEX_MULTIBLOCK = 1.")
+            }
+        }
+        .navigationTitle("This game's config").navigationBarTitleDisplayMode(.inline)
+    }
+}
+
 /// Game details › Find on Steam: searches the public store by title; choosing
 /// a result gives the entry that app's name and store artwork.
 struct SteamSearchView: View {
@@ -2453,6 +2646,232 @@ struct SteamSearchView: View {
                 catch is CancellationError { return }
                 catch { self.error = error.localizedDescription }
                 loading = false
+            }
+        }
+    }
+}
+
+/// Keyboard-and-mouse mode: one row per controller input with a menu of what it
+/// does, saved to the game. Used as a page of the Session menu (live: the driver
+/// takes each change at once) and as a sheet from Game details. Rows the player
+/// has not changed show the layout's or the template's action and are not stored.
+struct ControllerBindsPage: View {
+    @Binding var binds: [String: ControlAction]?
+    /// Vertical speed of the right-stick mouse, 1 = as horizontal; nil = 1.
+    @Binding var mouseVertical: Double?
+    /// The active layout's own bindings, so an unchanged row shows what really
+    /// happens in this session; Game details passes none.
+    var controls: [TouchControl] = []
+
+    private static let groups: [(String, [String])] = [
+        ("Sticks", ["LS", "RS"]),
+        ("Face", ["A", "B", "X", "Y"]),
+        ("Bumpers & triggers", ["LB", "RB", "LT", "RT"]),
+        ("D-pad", ["D↑", "D↓", "D←", "D→"]),
+        ("System", ["Menu", "View", "L3", "R3"]),
+    ]
+
+    var body: some View {
+        ForEach(Self.groups, id: \.0) { group in
+            Section(group.0) {
+                ForEach(group.1, id: \.self) { name in row(name) }
+            }
+        }
+        if effective("RS").stickKeys == nil {
+            Section("Right stick as mouse") {
+                LabeledContent("Vertical speed") {
+                    HStack {
+                        Slider(value: Binding(get: { mouseVertical ?? 1 }, set: { mouseVertical = abs($0 - 1) < 0.01 ? nil : $0 }), in: 0.25...1.5, step: 0.05)
+                        Text("\(Int(((mouseVertical ?? 1) * 100).rounded()))%").font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
+                    }
+                }
+                Text("Relative to horizontal. Games scale the camera's pitch and yaw differently from a mouse; lower this if the view climbs faster than it turns.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        Section {
+            Button("Reset all to defaults", role: .destructive) { reset() }
+                .disabled(!changed)
+            Text("Defaults: left stick WASD, right stick mouse, RT and LT click, D-pad arrows, A Space, B Ctrl, X E, Y R, LB Q, RB F, L3 Shift, R3 C, Start Esc, Select Tab. A touch control's own controller binding (control editor) applies when a row is at its default.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    /// Anything to reset: a bound row or a vertical speed other than 1.
+    var changed: Bool { !(binds ?? [:]).isEmpty || mouseVertical != nil }
+    func reset() { binds = nil; mouseVertical = nil }
+
+    /// What the input does in this session: the table's entry, else the layout's, else the template's.
+    private func effective(_ name: String) -> ControlAction {
+        let fromLayout = PadBindings.build(controls: controls)
+        return binds?[name] ?? (name == "LS" ? fromLayout.leftStick : name == "RS" ? fromLayout.rightStick : fromLayout.buttons[name] ?? .none)
+    }
+
+    private func row(_ name: String) -> some View {
+        let effective = effective(name)
+        let changed = binds?[name] != nil
+        return LabeledContent(PadBindings.displayName(name)) {
+            Menu {
+                if name == "LS" || name == "RS" {
+                    pick(name, name == "RS" ? "Mouse" : "Nothing", .none)
+                    pick(name, "WASD", .joystickWASD)
+                    pick(name, "Arrow keys", .joystickArrows)
+                } else {
+                    pick(name, "Left click", .mouseLeft)
+                    pick(name, "Right click", .mouseRight)
+                    Menu("Letters") { ForEach(0x41...0x5A, id: \.self) { vk in pick(name, String(UnicodeScalar(UInt8(vk))), .key(Int32(vk))) } }
+                    Menu("Numbers") { ForEach(0x30...0x39, id: \.self) { vk in pick(name, String(UnicodeScalar(UInt8(vk))), .key(Int32(vk))) } }
+                    Menu("Function keys") { ForEach(0...11, id: \.self) { i in pick(name, "F\(i + 1)", .key(Int32(0x70 + i))) } }
+                    Menu("Modifiers & editing") {
+                        pick(name, "Escape", .key(0x1B)); pick(name, "Tab", .key(0x09)); pick(name, "Shift", .key(0x10))
+                        pick(name, "Ctrl", .key(0x11)); pick(name, "Alt", .key(0x12)); pick(name, "Space", .key(0x20))
+                        pick(name, "Enter", .key(0x0D)); pick(name, "Backspace", .key(0x08)); pick(name, "Caps Lock", .key(0x14))
+                    }
+                    Menu("Navigation") {
+                        pick(name, "↑", .key(0x26)); pick(name, "↓", .key(0x28)); pick(name, "←", .key(0x25)); pick(name, "→", .key(0x27))
+                        pick(name, "Insert", .key(0x2D)); pick(name, "Delete", .key(0x2E)); pick(name, "Home", .key(0x24))
+                        pick(name, "End", .key(0x23)); pick(name, "Page Up", .key(0x21)); pick(name, "Page Down", .key(0x22))
+                    }
+                    Menu("Symbols") {
+                        pick(name, "-", .key(0xBD)); pick(name, "=", .key(0xBB)); pick(name, "[", .key(0xDB)); pick(name, "]", .key(0xDD))
+                        pick(name, "\\", .key(0xDC)); pick(name, ";", .key(0xBA)); pick(name, "'", .key(0xDE)); pick(name, ",", .key(0xBC))
+                        pick(name, ".", .key(0xBE)); pick(name, "/", .key(0xBF)); pick(name, "`", .key(0xC0))
+                    }
+                    Menu("Numpad") {
+                        ForEach(0...9, id: \.self) { i in pick(name, "Numpad \(i)", .key(Int32(0x60 + i))) }
+                        pick(name, "Numpad *", .key(0x6A)); pick(name, "Numpad +", .key(0x6B)); pick(name, "Numpad −", .key(0x6D))
+                        pick(name, "Numpad .", .key(0x6E)); pick(name, "Numpad /", .key(0x6F))
+                    }
+                    pick(name, "Show keyboard", .keyboardToggle)
+                    pick(name, "Nothing", .none)
+                }
+                if changed {
+                    Divider()
+                    Button("Default") { binds?[name] = nil; if binds?.isEmpty == true { binds = nil } }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Text(Self.describe(effective, input: name))
+                        .foregroundStyle(changed ? .primary : .secondary)
+                    Image(systemName: "chevron.up.chevron.down").font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func pick(_ name: String, _ title: String, _ action: ControlAction) -> some View {
+        Button(title) {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            var table = binds ?? [:]
+            table[name] = action
+            binds = table
+        }
+    }
+
+    /// Row text for an action, in the words the menu uses.
+    static func describe(_ action: ControlAction, input: String) -> String {
+        switch action {
+        case .none:            return input == "RS" ? "Mouse" : "Nothing"
+        case .mouseLeft:       return "Left click"
+        case .mouseRight:      return "Right click"
+        case .joystickWASD:    return "WASD"
+        case .joystickArrows:  return "Arrow keys"
+        case .keyboardToggle:  return "Show keyboard"
+        case .pad(let n):      return n
+        case .key(let vk):     return keyName(vk)
+        }
+    }
+    static func keyName(_ vk: Int32) -> String {
+        switch vk {
+        case 0x20: return "Space"
+        case 0x0D: return "Enter"
+        case 0x09: return "Tab"
+        case 0x1B: return "Escape"
+        case 0x10: return "Shift"
+        case 0x11: return "Ctrl"
+        case 0x12: return "Alt"
+        case 0x08: return "Backspace"
+        case 0x14: return "Caps Lock"
+        case 0x2D: return "Insert"
+        case 0x2E: return "Delete"
+        case 0x24: return "Home"
+        case 0x23: return "End"
+        case 0x21: return "Page Up"
+        case 0x22: return "Page Down"
+        case 0x70...0x7B: return "F\(vk - 0x6F)"
+        case 0x60...0x69: return "Numpad \(vk - 0x60)"
+        case 0x6A: return "Numpad *"
+        case 0x6B: return "Numpad +"
+        case 0x6D: return "Numpad −"
+        case 0x6E: return "Numpad ."
+        case 0x6F: return "Numpad /"
+        default:   return ControlAction.keyLabel(vk)
+        }
+    }
+}
+
+/// Game details and the Session menu: how a physical controller reaches the game.
+struct ControllerModeChoice: View {
+    @Binding var mode: String?
+    var body: some View {
+        LabeledContent("Controller") {
+            Picker("Controller", selection: Binding(get: { mode ?? "" }, set: { mode = $0.isEmpty ? nil : $0 })) {
+                Text("Game's own support").tag("")
+                Text("XInput and DirectInput").tag("dinput")
+                Text("Keyboard and mouse").tag("keys")
+            }.pickerStyle(.menu).labelsHidden()
+        }
+    }
+}
+
+/// Game details › Launch arguments: one chip per common flag, highlighted when
+/// the arguments contain it; a tap adds or removes it. -dx9 to -dx12 exclude each
+/// other, as do -windowed and -fullscreen. Quoted arguments are kept whole.
+struct LaunchFlagChips: View {
+    @Binding var arguments: String
+    static let flags = ["-dx11", "-dx12", "-dx10", "-dx9", "-windowed", "-fullscreen", "-nosplash"]
+
+    /// The arguments split at unquoted spaces and tabs, quotes kept.
+    static func tokens(_ text: String) -> [String] {
+        var out: [String] = [], current = "", quoted = false
+        for character in text {
+            if character == "\"" { quoted.toggle() }
+            if !quoted && (character == " " || character == "\t") {
+                if !current.isEmpty { out.append(current); current = "" }
+            } else {
+                current.append(character)
+            }
+        }
+        if !current.isEmpty { out.append(current) }
+        return out
+    }
+    static func contains(_ text: String, _ flag: String) -> Bool {
+        tokens(text).contains { $0.caseInsensitiveCompare(flag) == .orderedSame }
+    }
+    static func toggled(_ text: String, _ flag: String) -> String {
+        var parts = tokens(text)
+        if contains(text, flag) {
+            parts.removeAll { $0.caseInsensitiveCompare(flag) == .orderedSame }
+        } else {
+            let renderers = ["-dx9", "-dx10", "-dx11", "-dx12"]
+            if renderers.contains(flag) { parts.removeAll { renderers.contains($0.lowercased()) } }
+            if flag == "-windowed" { parts.removeAll { $0.lowercased() == "-fullscreen" } }
+            if flag == "-fullscreen" { parts.removeAll { $0.lowercased() == "-windowed" } }
+            parts.append(flag)
+        }
+        return parts.joined(separator: " ")
+    }
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(Self.flags, id: \.self) { flag in
+                    let on = Self.contains(arguments, flag)
+                    Button(flag) { arguments = Self.toggled(arguments, flag) }
+                        .buttonStyle(.bordered).tint(on ? Color.accentColor : Color.gray)
+                        .font(.caption.monospaced())
+                        .accessibilityValue(on ? "On" : "Off")
+                }
             }
         }
     }
@@ -2636,7 +3055,7 @@ struct RuntimeMemorySyncSettings: View {
                 Text("Video memory is how much graphics memory games are told they have. Automatic sizes it from the memory free at launch. Too high can get Madeira closed for using too much memory; too low makes games keep reloading textures.")
                 Text("Swap tier moves game data to a file on this device's storage when memory runs short, up to the chosen size, at some speed cost. Coverage decides which allocations it moves: large ones only (8 MB and up, the default), every allocation of 1 MB and up, or those plus allocations that overflow the game's address range. Wider coverage saves more memory but can slow a game down.")
                 Text("Sync engine: Fastsync (the default) handles events and semaphores in-process; its per-game options are in each game's details. Madsync is the older in-process engine. Wine standard sync uses neither. Only one engine runs at a time.")
-                Text("Eco mode starts every game with its threads at a low priority, which saves power but makes games run slower. Off by default. It is meant for loading screens: the ECO pill in the performance overlay turns it on and off while a game runs.")
+                Text("Eco mode starts every game with its threads at a low priority, which saves power but makes games run slower. Off by default. It is meant for loading screens: Eco mode in the in-game menu turns it on and off while a game runs.")
                 if changed { Text("Restart Madeira (close it from the app switcher) for these changes to apply.").foregroundStyle(.orange) }
             }
         }
@@ -2763,7 +3182,17 @@ struct LibraryHUD: View {
     /// A Madeira Dock start: its status, failure and Show desktop (DockStartScreen).
     @ObservedObject private var dockStart = DockStartScreen.shared
     private let sessionTools = MadeiraConfig.flag("MADEIRA_SESSION_TOOLS")
+    /// The in-game menu's Diagnostics (frame capture, GPU sync), for testing: off
+    /// unless madeira.cfg sets env.MADEIRA_SESSION_DIAGNOSTICS = 1. A capture
+    /// writes render-target pixels to Documents/capture, which Files shows.
+    private let sessionDiagnostics = MadeiraConfig.flag("MADEIRA_SESSION_DIAGNOSTICS", fallback: false)
+    /// The developer overlay's ECO and F pills, which a library session does not
+    /// show; read again each time the menu opens.
+    @State private var eco = madeira_get_eco() != 0
+    @State private var fenceMode = FPSOverlayFenceMode.current
     @State private var launchVisible = false
+    /// The Session menu's Controller binds page (keyboard-and-mouse mode).
+    @State private var bindsPage = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         GeometryReader { geo in
@@ -2781,7 +3210,8 @@ struct LibraryHUD: View {
                 if !model.launching { LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.menu {
                     Color.black.opacity(0.5).ignoresSafeArea().onTapGesture { model.menu = false }.transition(.opacity)
-                    menu.frame(width: min(460, geo.size.width - 32), height: min(650, geo.size.height - geo.safeAreaInsets.top - geo.safeAreaInsets.bottom - 24))
+                    (bindsPage ? AnyView(bindsMenu) : AnyView(menu))
+                        .frame(width: min(460, geo.size.width - 32), height: min(650, geo.size.height - geo.safeAreaInsets.top - geo.safeAreaInsets.bottom - 24))
                         .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 28))
                         .clipShape(RoundedRectangle(cornerRadius: 28))
                         .overlay(RoundedRectangle(cornerRadius: 28).stroke(.white.opacity(0.15)))
@@ -2799,7 +3229,9 @@ struct LibraryHUD: View {
         .onAppear { model.saveCurrentProfile() }
         .onChange(of: model.menu) { _, open in
             LibraryController.shared.configure(enabled: model.enabled, ownsInput: open)
+            if !open { bindsPage = false }
             if !open { model.saveCurrentProfile() }
+            if open { eco = madeira_get_eco() != 0; fenceMode = FPSOverlayFenceMode.current }
         }
         .onReceive(LibraryController.shared.commands) { command in
             if command == "menu" { if model.menu { model.menu = false } else { model.showMenu() } }
@@ -2913,6 +3345,29 @@ struct LibraryHUD: View {
         }
     }
 
+    /// Controller binds, as a page of the Session menu: a Form, so the rows read
+    /// like Game details; the driver takes each change at once (model.controllerBinds).
+    private var bindsMenu: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Button("Session", systemImage: "chevron.left") { bindsPage = false }.buttonStyle(.borderless)
+                Spacer()
+                Text("Controller binds").font(.headline)
+                Spacer()
+                Button("Reset") { model.controllerBinds = [:]; model.padMouseVertical = 1; model.saveCurrentProfile() }
+                    .buttonStyle(.borderless).disabled(model.controllerBinds.isEmpty && model.padMouseVertical == 1)
+                Button("Done") { model.menu = false }.buttonStyle(.bordered)
+            }.padding(.horizontal, 22).padding(.top, 22).padding(.bottom, 8)
+            Form {
+                ControllerBindsPage(binds: Binding(get: { model.controllerBinds.isEmpty ? nil : model.controllerBinds },
+                                                   set: { model.controllerBinds = $0 ?? [:]; model.saveCurrentProfile() }),
+                                    mouseVertical: Binding(get: { model.padMouseVertical == 1 ? nil : model.padMouseVertical },
+                                                           set: { model.padMouseVertical = $0 ?? 1; model.saveCurrentProfile() }),
+                                    controls: controls.controls)
+            }.scrollContentBackground(.hidden)
+        }
+    }
+
     private var menu: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
@@ -2930,6 +3385,12 @@ struct LibraryHUD: View {
                 LabeledContent("Opacity") { Slider(value: $model.opacity, in: 0.15...1) }
                 LabeledContent("Size") { Slider(value: $controls.sizeScale, in: 0.5...2) }
                 Button("Edit controls", systemImage: "slider.horizontal.3") { controls.visible = true; controls.editing = true; model.menu = false }
+                if GamepadInput.keyboardMouseAvailable {
+                    ControllerModeChoice(mode: Binding(get: { model.controllerMode }, set: { model.controllerMode = $0; model.saveCurrentProfile() }))
+                    if model.controllerMode == "keys" {
+                        Button("Controller binds", systemImage: "gamecontroller") { bindsPage = true }
+                    }
+                }
                 Button("Keyboard", systemImage: "keyboard") { model.menu = false; LibraryKeyboard.show() }
                 Divider()
                 FPSChoice(mode: Binding(get: { model.fpsMode }, set: { model.setFPS($0) }))
@@ -2943,16 +3404,47 @@ struct LibraryHUD: View {
                     }
                 }
                 Divider()
+                // ml1133's ECO switch, live: the same as the developer overlay's ECO pill.
+                Text("CPU").font(.headline)
+                Toggle("Eco mode", isOn: Binding(get: { eco }, set: { on in eco = on; madeira_set_eco(on ? 1 : 0) }))
+                Text("Runs the game's threads at a low priority, on the efficiency cores: cooler and slower. Use it while a game loads and turn it off to play.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Divider()
                 Text("Mouse & pointer").font(.headline)
                 LibraryPointerSettings()
                 Divider()
                 Toggle("Performance overlay", isOn: $model.performance)
                 if model.performance {
-                    ForEach(["FPS", "Frame time", "RAM", "Battery"], id: \.self) { field in
+                    ForEach(["FPS", "Frame time", "RAM", "Battery", "Thermal"], id: \.self) { field in
                         Toggle(field, isOn: Binding(get: { model.overlayFields.contains(field) }, set: { on in
                             model.overlayFields.removeAll { $0 == field }; if on { model.overlayFields.append(field) }
                         })).font(.subheadline)
                     }
+                }
+                // The developer overlay's CAP and F pills (FPSOverlay), for library
+                // sessions: only with MADEIRA_SESSION_DIAGNOSTICS=1 (and not with
+                // MADEIRA_SESSION_TOOLS=0).
+                if sessionTools && sessionDiagnostics {
+                    Divider()
+                    Text("Diagnostics").font(.headline)
+                    Button("Capture the next frame", systemImage: "camera.viewfinder") {
+                        model.menu = false
+                        // After the menu has gone, so the frame shows what the player saw.
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                            madeira_capture_request(1)
+                            LogStore.shared.log("[capture] frame capture requested from the in-game menu")
+                        }
+                    }
+                    LabeledContent("GPU sync") {
+                        Picker("GPU sync", selection: Binding(get: { fenceMode }, set: { mode in
+                            fenceMode = mode; FPSOverlayFenceMode.current = mode
+                            madeira_set_fence_mode(Int32(mode == 0 ? 7 : mode))
+                        })) {
+                            Text("F1").tag(1); Text("F6").tag(6); Text("F5").tag(5); Text("F0").tag(0)
+                        }.pickerStyle(.segmented).frame(maxWidth: 220)
+                    }
+                    Text("Both apply to Direct3D 12 games only. Capture writes the render passes of the next frame to Documents/capture and its draw list to the log. GPU sync: F1 makes every pass wait for the one before (the default), F6 waits only where the game's barriers ask, F5 makes render passes wait at the fragment stage, F0 has no sync at all (expect flicker; for tests).")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 if let appID = model.activeEntry?.steamAppID, SteamOwnedLibrary.cloudQuitEnabled {
                     Divider()
@@ -2998,6 +3490,9 @@ struct LibraryMetrics: View {
     @State private var fps = 0.0
     @State private var memory = 0
     @State private var battery = -1
+    /// iOS lowers clocks from .serious on, so a frame rate that sags after a few
+    /// minutes can be told apart from one the game or the runtime caused.
+    @State private var thermal = ProcessInfo.processInfo.thermalState
     private let ticks = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     var body: some View {
         Text(parts.joined(separator: "  ·  "))
@@ -3012,6 +3507,11 @@ struct LibraryMetrics: View {
                 let result = withUnsafeMutablePointer(to: &info) { $0.withMemoryRebound(to: integer_t.self, capacity: Int(size)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &size) } }
                 if result == KERN_SUCCESS { memory = Int(info.phys_footprint / 1048576) }
                 battery = UIDevice.current.batteryLevel < 0 ? -1 : Int(UIDevice.current.batteryLevel * 100)
+                let state = ProcessInfo.processInfo.thermalState
+                if state != thermal {
+                    LogStore.shared.log("[thermal] \(DeviceLoadDiagnostics.thermalName(thermal)) -> \(DeviceLoadDiagnostics.thermalName(state)) at \(String(format: "%.0f", fps)) FPS")
+                    thermal = state
+                }
             }
     }
     private var parts: [String] {
@@ -3020,6 +3520,15 @@ struct LibraryMetrics: View {
         if model.overlayFields.contains("Frame time") { result.append(fps > 0 ? String(format: "%.1f ms avg", 1000 / fps) : "— ms") }
         if model.overlayFields.contains("RAM") { result.append("\(memory) MB") }
         if model.overlayFields.contains("Battery"), battery >= 0 { result.append("\(battery)%") }
+        if model.overlayFields.contains("Thermal") {
+            switch thermal {
+            case .nominal: result.append("Cool")
+            case .fair: result.append("Warm")
+            case .serious: result.append("Hot")
+            case .critical: result.append("Critical")
+            @unknown default: break
+            }
+        }
         return result
     }
 }

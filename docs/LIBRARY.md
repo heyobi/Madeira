@@ -59,7 +59,8 @@ Removing an entry never removes the game's files or saves.
   desktop) with its own profile; its Resolution is the desktop's size.
 - The build label (`MadeiraBuild` in Info.plist, else the bundle version) is
   shown in Settings (Ready to play) and in the developer interface's status row.
-- **Settings**: JIT and memory status, Enable JIT, extended logging, pointer
+- **Settings**: JIT and memory status, Enable JIT, JIT method and setup
+  (StikDebug or the built-in helper), extended logging, pointer
   mode (Absolute, Relative or Touch) and touch sensitivity, **Display** (hold
   the display at its maximum rate, off by default), **Memory & sync** (swap tier
   Off/1/2/4 GB, off by default; sync engine, Fastsync by default), the interface
@@ -93,16 +94,35 @@ starting screen takes over (or an error is shown). A profile holds:
   uncapped, so the choice is hidden and a saved 30 runs as 60);
 - reduced-precision x87: off by default, as in FEX; only an explicit choice
   exports `FEX_X87REDUCEDPRECISION=1`;
+- **AVX and AVX2**: off by default, as in FEX's iOS build; only an explicit
+  choice exports `MADEIRA_FEX_AVX=1`, which makes the ARM64EC FEX module report
+  and emulate AVX/AVX2 for a game built for AVX processors (64-bit games; WOW64
+  has no AVX);
 - **CPU cores reported** (Automatic, 1, 2, 4 or 6) and **D3D9 anisotropic
   filtering** (Application default, up to 1×, 2×, 4× or 8×): only a choice
   other than the default exports `MADEIRA_CPU_COUNT` (wine) or
-  `DXMT_D9_ANISO_LIMIT` (DXMT); the defaults export nothing. The library
-  exports no other engine switch;
+  `DXMT_D9_ANISO_LIMIT` (DXMT); the defaults export nothing. AVX above, frame
+  generation below and the game's own config lines are the library's other
+  engine switches;
+- **Frame generation (experimental)**, off by default: exports
+  `MADEIRA_FRAMEGEN=1`, and DXMT's present path (D3D11 and D3D12 alike) shows a
+  MetalFX-interpolated frame between every two game frames; FPS limits do not
+  apply while it is on. The Desktop's page has it too;
 - launch arguments (double-quoted tokens, at most 64 and 4 KB in total; not
-  for Steam games, which Madeira Dock starts with Steam's own launch option);
+  for Steam games, which Madeira Dock starts with Steam's own launch option),
+  in their own section with chips for common flags (`-dx11`, `-dx12`, `-dx10`,
+  `-dx9`, `-windowed`, `-fullscreen`, `-nosplash`; the renderer flags exclude
+  each other, as do the window flags) and the command line the next start runs;
 - performance overlay, live logs and touch controls for the session, with the
   controls' **opacity** and overall **size**. The touch layout itself is saved
-  per game from the in-game editor.
+  per game from the in-game editor;
+- **Advanced › This game's config**: lines in madeira.cfg's syntax for this
+  game only. Each launch writes them to `Application Support/madeira-game.cfg`
+  and exports `MADEIRA_CFG_GAME` (unset when there are none): a key set there
+  wins over madeira.cfg wherever the runtime reads it (`build/madeira_cfg.h`),
+  `env.NAME` lines are exported after madeira.cfg's, and `dxmt` options are
+  added to madeira.cfg's (all joined with `;`, as `DXMT_CONFIG` requires).
+  Settings the app reads itself at launch (such as `pool`) stay global.
 
 A game you added starts directly. A Steam game's page (`docs/STEAM_LIBRARY.md`)
 adds a **Steam** section under the library details: **Start with** Madeira
@@ -132,9 +152,15 @@ in-game menu:
    game), their **Opacity** and **Size**, **Edit controls**
    (the existing editor) and the **Keyboard** (its own key window, with an
    Esc/Ctrl/Shift/Alt/Tab/Enter/arrow row; modifiers latch);
-2. the FPS limit, **Aspect & scaling**, and the mouse and pointer settings;
+2. the FPS limit, **Aspect & scaling**, **Eco mode** (the developer overlay's
+   ECO pill: guest threads at a low priority while it is on), and the mouse and
+   pointer settings;
 3. the performance overlay and its fields (FPS, average frame time, memory
-   footprint, battery);
+   footprint, battery, and the thermal state: Cool, Warm, Hot or Critical; a
+   change is logged as `[thermal]` while the overlay is shown), then
+   **Diagnostics**: **Capture the next frame** and **GPU sync** F1/F6/F5/F0,
+   the developer overlay's CAP and F pills, for Direct3D 12 games (shown only with
+   `MADEIRA_SESSION_DIAGNOSTICS=1`);
 4. **Quit game** in red. Quit asks the program to close with Alt+F4 through
    the normal input queue, so it can save; the session ends when it exits.
 
@@ -163,33 +189,50 @@ process (the wineserver's permanent objects from the first session remain and
 the registry initialisation aborts). The library asks to restart Madeira
 instead.
 
-## Steam setup
+## First-run setup
 
-The code is `app/Madeira/Onboarding.swift`. It uses Steam sign-in
-(`docs/STEAM_SIGNIN.md`) and Madeira Dock (`docs/MADEIRA_DOCK.md`) through
-their public pieces only: `SteamSignInModel`/`SteamSignInView` for signing in
-and out (the token stays in sign-in's Keychain store), and
-`MadeiraDockModel.prepareClient()`/`MadeiraDockView` for Dock.
+The code is `app/Madeira/Onboarding.swift`. It uses `JITCoordinator` for the
+JIT method and validated pairing-file import, `OnDevicePairing` for in-app
+pairing (iOS 27, `docs/JIT.md`), Steam sign-in
+(`docs/STEAM_SIGNIN.md`) through `SteamSignInModel`/`SteamSignInView` (the
+token stays in sign-in's Keychain store), and Madeira Dock
+(`docs/MADEIRA_DOCK.md`) through
+`MadeiraDockModel.prepareClient()`/`MadeiraDockView`.
 
-**First-run setup.** On a new install the library opens a full-screen setup
-once: welcome, **Sign in to Steam**, **Prepare Madeira Dock** (Valve's client
-components, about 73 MB, only when Dock is available), done. Every step has
-**Set up later**, and the welcome page has **Skip setup**. Finishing or
-skipping stores `madeiraOnboardingDone` in the app's UserDefaults, which iOS
-removes with the app. Setup opens only when there is something to set up: the
-sign-in page needs Steam sign-in or Dock, and without either setup never
-opens. It never opens over a running session.
+**First-run setup.** On a new install (and once after an update that raises
+the setup revision, below) the library opens a full-screen setup: welcome, **Install LocalDevVPN** (only when it is missing: every JIT way
+reaches the device through it; **Get LocalDevVPN** opens the App Store, and
+Madeira checks again with `canOpenURL` whenever it comes back to the front),
+**Set up JIT**, **Sign in to Steam**, **Prepare Madeira Dock**
+(Valve's client components, about 73 MB, only when Dock is available), done.
+The JIT page offers three ways in, **In-app** (iOS 27 and later),
+**In-app with pairing file** and **StikDebug**, or **I'll do this later**.
+Each way opens numbered steps that tick off as they are done, with **Back to
+options**. A completed pairing or a valid pairing-file import selects Built-in
+StikJIT; it does not enable JIT yet. Steam and Dock steps have **Set up later**, and the welcome
+page has **Skip setup**. Finishing or skipping stores the setup revision
+(`madeiraOnboardingRevision`) in the app's UserDefaults, which iOS removes with
+the app. Setup opens on a new install, and once after an update whose
+`OnboardingRules.revision` is higher than the stored one; raise it in a release
+whose setup every existing install should see. Revision 2 (Install LocalDevVPN,
+in-app pairing, the Madeira JIT shortcut) also reopens setup for installs
+that finished it before revisions (`madeiraOnboardingDone`). The JIT page is always available; Steam pages follow their feature
+switches. Setup never opens over a running session.
 
-Setup is app UI only. It starts no Wine session, and the component download
-runs Dock's own verified download without Wine. It changes no JIT pool, engine
-switch or configuration default.
+Setup starts no Wine session and allocates no JIT pool. It stores the selected
+JIT method and may store a validated pairing file (paired on the device or
+imported) in the Keychain (docs/JIT.md). On iOS 27, a Connect automatically
+page after the JIT guide offers the Madeira JIT shortcut and its switch; the
+component download runs Dock's own
+verified download without Wine. It changes no engine switch or launch
+configuration.
 
-**Settings › Steam** shows the signed-in account with **Sign out of Steam**
+**Settings › JIT** and **Settings › Steam** both show **Run setup again**.
+Settings › Steam also shows the signed-in account with **Sign out of Steam**
 (or **Sign in to Steam**), **Madeira Dock** (Dock's sheet, with the last Dock
-result under it) and **Run setup again**. A game started from the Dock sheet
-here runs as a library session: full-screen view, starting screen, in-game
-menu, and the one-session-per-run rule. That session is not added to the
-library.
+result under it). A game started from the Dock sheet here runs as a library
+session: full-screen view, starting screen, in-game menu, and the
+one-session-per-run rule. That session is not added to the library.
 
 **Steam games in the library** (`app/Madeira/SteamGames.swift`). When Madeira
 Dock is available, the library shows a **Steam** section above **Other
@@ -242,10 +285,11 @@ menu owns input, the game sees a connected pad at rest.
 | `MADEIRA_UI_LOG_IDLE` | on | the log view keeps parsing while hidden |
 | `MADEIRA_LOG_VIA_STDERR` | on | Swift log lines use their own file handle |
 | `MADEIRA_RUNTIME_SETTINGS` | on | no Display and Memory & sync sections in Settings |
-| `MADEIRA_SESSION_TOOLS` | on | no Aspect & scaling in the in-game menu, and a session does not save it |
+| `MADEIRA_SESSION_TOOLS` | on | no Aspect & scaling (a session does not save it) and no Diagnostics in the in-game menu |
+| `MADEIRA_SESSION_DIAGNOSTICS` | off | `1` shows the in-game menu's Diagnostics: frame capture (render-target pixels to `Documents/capture`) and GPU sync, for Direct3D 12 games |
 | `MADEIRA_SCREEN_SHAPE_RESOLUTION` | on | no Screen shape resolution choice |
 | `MADEIRA_FRONTEND_KEYBOARD` | on | Keyboard opens the game view's own keyboard instead of the key window |
-| `MADEIRA_ONBOARDING` | on | first-run setup never opens, and Settings › Steam has no **Run setup again** |
+| `MADEIRA_ONBOARDING` | on | first-run setup never opens, and Settings › JIT/Steam have no **Run setup again** |
 | `MADEIRA_LIBRARY_COLLAPSE` | on | the **Steam** and **Other games** titles do not collapse (**Not installed** still folds) |
 | `MADEIRA_LIBRARY_AMBIENT` | on | no ambient light around the library's grid cards |
 
@@ -268,10 +312,10 @@ math, controller commands, the exit hook, and the presence of the details and
 in-game menu options), `tests/host/check-runtime-settings.py`
 (`MadeiraConfig.set` and the Settings defaults) and
 `tests/host/check-library-api.py` (renderer detection and the badge).
-`tests/host/check-onboarding.py` covers Steam setup: the pages with and
-without Dock, the done key, the `MADEIRA_ONBOARDING` switch, and the wiring
-(no Wine session, no pool or engine switch, sign-in and Dock only through
-their public pieces).
+`tests/host/check-onboarding.py` covers first-run setup: the JIT choices,
+pairing import, pages with and without Dock, the done key, the
+`MADEIRA_ONBOARDING` switch, and the wiring (no Wine session, no pool or
+engine switch; JIT, sign-in and Dock through their public pieces).
 `tests/host/check-steam-games.py` covers the library's Steam section: Dock's
 discovery on a synthetic drive_c laid out as Steam writes it, the merge of
 installed and owned games, the section, status, card pill, search, Play and

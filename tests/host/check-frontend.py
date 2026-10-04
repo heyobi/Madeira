@@ -85,6 +85,8 @@ enum MadeiraConfig {
     static func get(_ key: String) -> String? { values[key] }
     static func bool(_ key: String, default dflt: Bool = false) -> Bool { values[key].map { ["1", "on", "true", "yes"].contains($0) } ?? dflt }
     @discardableResult static func set(_ key: String, _ value: String?) -> Bool { values[key] = value; return true }
+    static var game: String?   // stands in for the file MADEIRA_CFG_GAME names
+    @discardableResult static func applyGame(_ text: String?) throws -> [String: String] { game = text; return [:] }
 }
 final class LogStore { static let shared = LogStore(); var lines: [String] = []; func log(_ s: String) { lines.append(s) } }
 var published: (Int32, Int32) = (0, 0)
@@ -93,6 +95,8 @@ var vsync: Int32 = -1
 func madeira_set_vsync_locked(_ mode: Int32) { vsync = mode }
 enum ProMotionIntent { static var has30Cap = true }
 struct TouchControl: Codable, Equatable { var nx = 0.5 }
+enum ControlAction: Codable, Equatable, Hashable { case none }   // LibraryEntry.controllerBinds
+enum GamepadInput { static let keyboardMouseAvailable = true }   // LibraryEntry's per-game DirectInput choice
 enum LibraryError: LocalizedError { case message(String) }
 func env(_ name: String) -> String? { getenv(name).map { String(cString: $0) } }
 '''
@@ -186,6 +190,11 @@ MadeiraConfig.values = [:]; game.fastSync = nil; game.semaphoreFastPath = nil
 game.reducedX87 = true; game.applyEnvironment()
 expect(env("FEX_X87REDUCEDPRECISION") == "1", "reduced x87 exported when chosen")
 game.reducedX87 = false
+// This game's own config lines: handed over at every launch, nil when there are none.
+game.config = "fence-chain = 6"; game.applyEnvironment()
+expect(MadeiraConfig.game == "fence-chain = 6", "the game's own config is applied at launch")
+game.config = nil; game.applyEnvironment()
+expect(MadeiraConfig.game == nil, "a game without its own config clears the previous one")
 // FPS limit: 30 needs DXMT's 30 FPS cap; without it a saved 30 runs as 60.
 game.fpsMode = 3; game.applyEnvironment()
 expect(vsync == 3, "30 FPS applied when DXMT has the cap")
@@ -403,7 +412,8 @@ last = form[[m.start() for m in re.finditer(r'\bSection\b', form)][-1]:]
 check('header: { Text("Credits") }' in last and form.count('Text("Credits")') == 1,
       'Settings: Credits is the last section')
 for who in ('name: "Will Faust", handle: "willfaust"', 'name: "Nick", handle: "125hz"',
-            'name: "Jfishin", handle: "Jfishin"'):
+            'name: "Jfishin", handle: "Jfishin"', 'name: "Jesse", handle: "JesseLovelace"',
+            'name: "Dan Perks", handle: "danperks"'):
     check('MadeiraCredit(' + who in last, 'Settings credits: ' + who)
 check('https://github.com/\\(handle)' in block(lib, 'struct MadeiraCredit: View'),
       'a credit links the GitHub account')
